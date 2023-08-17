@@ -1,3 +1,4 @@
+use crate::cpu::vc::VcError;
 use crate::fs::FsError;
 use crate::fw_cfg::FwCfgError;
 use crate::sev::ghcb::GhcbError;
@@ -33,4 +34,6 @@ pub enum SvsmError {
     Acpi,
     // Errors from file systems
     FileSystem(FsError),
+    // Errors from #VC handler
+    Vc(VcError),
 }
