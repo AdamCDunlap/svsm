@@ -5,7 +5,6 @@
 // Author: Joerg Roedel <jroedel@suse.de>
 
 use crate::address::{Address, VirtAddr};
-use crate::cpu::insn::Instruction;
 use crate::cpu::registers::{X86GeneralRegs, X86InterruptFrame};
 use crate::types::SVSM_CS;
 use core::arch::{asm, global_asm};
@@ -45,7 +44,6 @@ pub struct X86ExceptionContext {
     pub vector: usize,
     pub error_code: usize,
     pub frame: X86InterruptFrame,
-    pub insn: Instruction,
 }
 
 #[derive(Copy, Clone, Default, Debug)]
@@ -145,8 +143,6 @@ pub fn triple_fault() {
 #[cfg(feature = "enable-stacktrace")]
 extern "C" {
     static generic_idt_handler_return: u8;
-    pub static stage2_idt_handler_array: u8;
-    pub static svsm_idt_handler_array: u8;
 }
 
 #[cfg(feature = "enable-stacktrace")]
@@ -157,44 +153,6 @@ pub fn is_exception_handler_return_site(rip: VirtAddr) -> bool {
 
 global_asm!(
     r#"
-        /* Stage 2 handler array setup */
-        .text
-    push_regs:
-        pushq   %rax
-        pushq   %rbx
-        pushq   %rcx
-        pushq   %rdx
-        pushq   %rsi
-        pushq   %rdi
-        pushq   %rbp
-        pushq   %r8
-        pushq   %r9
-        pushq   %r10
-        pushq   %r11
-        pushq   %r12
-        pushq   %r13
-        pushq   %r14
-        pushq   %r15
-
-        movq    %rsp, %rdi
-        call    stage2_generic_idt_handler
-
-        jmp generic_idt_handler_return
-        
-        .align 32
-        .globl stage2_idt_handler_array
-    stage2_idt_handler_array:
-        i = 0
-        .rept 32
-        .align 32
-        .if ((0x20027d00 >> i) & 1) == 0
-        pushq   $0
-        .endif
-        pushq   $i  /* Vector Number */
-        jmp push_regs
-        i = i + 1
-        .endr
-        
         /* Needed by the stack unwinder to recognize exception frames. */
         .globl generic_idt_handler_return
     generic_idt_handler_return:

@@ -7,10 +7,9 @@
 use super::super::control_regs::read_cr2;
 use super::super::extable::handle_exception_table;
 use super::super::tss::IST_DF;
-use super::super::vc::stage2_handle_vc_exception;
+use super::super::vc::handle_vc_exception;
 use super::common::{
-    load_idt, svsm_idt_handler_array, Idt, IdtEntry, BP_VECTOR, DF_VECTOR, GLOBAL_IDT, GP_VECTOR,
-    PF_VECTOR, VC_VECTOR,
+    load_idt, Idt, IdtEntry, BP_VECTOR, DF_VECTOR, GLOBAL_IDT, GP_VECTOR, PF_VECTOR, VC_VECTOR,
 };
 use crate::address::VirtAddr;
 use crate::cpu::X86ExceptionContext;
@@ -45,7 +44,7 @@ pub fn idt_init() {
 }
 
 #[no_mangle]
-pub fn generic_idt_handler(ctx: &mut X86ExceptionContext) {
+pub extern "C" fn generic_idt_handler(ctx: &mut X86ExceptionContext) {
     if ctx.vector == DF_VECTOR {
         let cr2 = read_cr2();
         let rip = ctx.frame.rip;
@@ -76,7 +75,7 @@ pub fn generic_idt_handler(ctx: &mut X86ExceptionContext) {
             );
         }
     } else if ctx.vector == VC_VECTOR {
-        stage2_handle_vc_exception(ctx);
+        handle_vc_exception(ctx);
     } else if ctx.vector == BP_VECTOR {
         handle_bp_exception(ctx);
     } else {
@@ -91,6 +90,10 @@ pub fn generic_idt_handler(ctx: &mut X86ExceptionContext) {
             );
         }
     }
+}
+
+extern "C" {
+    static svsm_idt_handler_array: u8;
 }
 
 global_asm!(

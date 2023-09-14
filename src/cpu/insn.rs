@@ -9,7 +9,6 @@ extern crate alloc;
 use crate::cpu::vc::VcError;
 use crate::error::SvsmError;
 use core::ptr;
-use log::info;
 
 const MAX_INSN_SIZE: usize = 15;
 const MAX_INSN_FIELD_SIZE: usize = 3;
