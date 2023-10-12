@@ -3,10 +3,12 @@
 // Copyright (c) 2022-2023 SUSE LLC
 //
 // Author: Joerg Roedel <jroedel@suse.de>
+#![allow(dead_code, unused_imports, unused_macros)]
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::flush_tlb_global_sync;
-use crate::cpu::msr::{write_msr, SEV_GHCB};
+use crate::cpu::msr::{rdtsc, rdtscp, write_msr, RdtscpOut, SEV_GHCB};
+use crate::cpu::percpu::this_cpu_mut;
 use crate::error::SvsmError;
 use crate::mm::pagetable::get_init_pgtable_locked;
 use crate::mm::validate::{
@@ -14,9 +16,13 @@ use crate::mm::validate::{
 };
 use crate::mm::virt_to_phys;
 use crate::sev::sev_snp_enabled;
-use crate::sev::utils::raw_vmgexit;
+use crate::sev::utils::{get_dr7, raw_vmgexit, raw_vmmcall, set_dr7};
 use crate::types::{PageSize, PAGE_SIZE_2M};
+use core::arch::asm;
+use core::cell::RefCell;
 use core::{mem, ptr};
+use raw_cpuid::CpuId;
+use x86::msr;
 
 use super::msr_protocol::{invalidate_page_msr, register_ghcb_gpa_msr, validate_page_msr};
 use super::{pvalidate, PvalidateOp};
@@ -481,4 +487,349 @@ impl GHCB {
         self.vmgexit(GHCBExitCode::RUN_VMPL, vmpl, 0)?;
         Ok(())
     }
+}
+
+// const CPUID_APID_ID: u32 = 0x1;
+// const CPUID_EXTENDED_FEATURE: u32 = 0x80000001;
+// const CPUID_PROCESSOR_NAME1: u32 = 0x80000002;
+// const CPUID_PROCESSOR_NAME2: u32 = 0x80000003;
+// const CPUID_PROCESSOR_NAME3: u32 = 0x80000004;
+const CPUID_FN_LARGEST_EXT_FUNC_NUM: u32 = 0x80000000;
+const CPUID_FN_ENCRYPT_MEM_CAPAB: u32 = 0x8000001f;
+const MSR_SEV_STATUS_SUPPORT_MASK: u32 = 0b10;
+// const MSR_SVM_SUPPORT_MASK: u32 = 0b100;
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_sev_snp_enablement_cpuid() {
+    let cpuid = CpuId::new();
+    let mem_encrypt_info = cpuid
+        .get_memory_encryption_info()
+        .expect("Expected cpuid to have memory encryption leaf");
+
+    assert!(mem_encrypt_info.has_sev_snp());
+}
+
+const MSR_SEV_STATUS: u32 = 0b10;
+const MSR_SEV_STATUS_SEV_SNP_ENABLED: u64 = 0b100;
+const GHCB_FILL_TEST_VALUE: u8 = b'1';
+
+fn fill_ghcb_with_test_data() {
+    let ghcb = this_cpu_mut().ghcb();
+    unsafe {
+        // The count param is 1 to only write one ghcb's worth of data
+        core::ptr::write_bytes(ghcb as *mut GHCB, GHCB_FILL_TEST_VALUE, 1);
+    }
+}
+fn verify_ghcb_was_altered() {
+    let ghcb = this_cpu_mut().ghcb();
+    let ghcb_bytes: &[u8; core::mem::size_of::<GHCB>()] = unsafe { core::mem::transmute(ghcb) };
+    let changed_byte = ghcb_bytes.iter().find(|&&v| v != GHCB_FILL_TEST_VALUE);
+    assert!(changed_byte.is_some());
+}
+
+// Wraps an expression with an assertion that the expression ended up altering the ghcb.
+macro_rules! verify_ghcb_gets_altered {
+    ($nae_func:expr) => {{
+        fill_ghcb_with_test_data();
+        let result = $nae_func;
+        verify_ghcb_was_altered();
+        result
+    }};
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_sev_snp_enablement_msr() {
+    let sev_status = verify_ghcb_gets_altered!(unsafe { msr::rdmsr(MSR_SEV_STATUS) });
+    assert_ne!(sev_status & MSR_SEV_STATUS_SEV_SNP_ENABLED, 0);
+}
+
+// TODO: PSC test
+
+// cpuid processor name -- probably unnecessary?
+
+const APIC_DEFAULT_PHYS_BASE: u64 = 0xfee00000; // KVM's default
+const APIC_BASE_PHYS_ADDR_MASK: u64 = 0xffffff000; // bit 12-35
+
+unsafe fn vmmcall() {}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_rdmsr_apic() {
+    let apic_base = verify_ghcb_gets_altered!(unsafe { msr::rdmsr(msr::APIC_BASE) });
+    assert_eq!(apic_base & APIC_BASE_PHYS_ADDR_MASK, APIC_DEFAULT_PHYS_BASE);
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_rdmsr_debug_ctl() {
+    let apic_base = verify_ghcb_gets_altered!(unsafe { msr::rdmsr(msr::DEBUGCTLMSR) });
+    assert_eq!(apic_base, 0);
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_wrmsr_tsc_aux() {
+    let test_val = 0x1234;
+    verify_ghcb_gets_altered!(unsafe { msr::wrmsr(msr::IA32_TSC_AUX, test_val) });
+    let readback = verify_ghcb_gets_altered!(unsafe { msr::rdmsr(msr::IA32_TSC_AUX) });
+    assert_eq!(test_val, readback);
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_vmmcall_error() {
+    let res = verify_ghcb_gets_altered!(unsafe { raw_vmmcall(1005, 0, 0, 0) });
+    assert_eq!(res, -1000);
+}
+
+const VMMCALL_HC_VAPIC_POLL_IRQ: u32 = 1;
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_vmmcall_vapic_poll_irq() {
+    let res = verify_ghcb_gets_altered!(unsafe { raw_vmmcall(VMMCALL_HC_VAPIC_POLL_IRQ, 0, 0, 0) });
+    assert_eq!(res, 0);
+}
+
+const DR7_DEFAULT: u64 = 0x400;
+const DR7_TEST: u64 = 0x401;
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_read_write_dr7() {
+    let old_dr7 = verify_ghcb_gets_altered!(unsafe { get_dr7() });
+    assert_eq!(old_dr7, DR7_DEFAULT);
+
+    verify_ghcb_gets_altered!(unsafe { set_dr7(DR7_TEST) });
+    let new_dr7 = verify_ghcb_gets_altered!(unsafe { get_dr7() });
+    assert_eq!(new_dr7, DR7_TEST);
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_rdtsc() {
+    let mut prev: u64 = rdtsc();
+    for _ in 0..50 {
+        let cur = rdtsc();
+        assert!(cur > prev);
+        prev = cur;
+    }
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_rdtscp() {
+    let expected_pid = u32::try_from(verify_ghcb_gets_altered!(unsafe {
+        msr::rdmsr(msr::IA32_TSC_AUX)
+    }))
+    .expect("pid should be 32 bits");
+    let RdtscpOut {
+        timestamp: mut prev,
+        pid,
+    } = rdtscp();
+    assert_eq!(pid, expected_pid);
+    for _ in 0..50 {
+        let RdtscpOut {
+            timestamp: cur,
+            pid,
+        } = rdtscp();
+        assert_eq!(pid, expected_pid);
+        assert!(cur > prev);
+        prev = cur;
+    }
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_wbinvd() {
+    verify_ghcb_gets_altered!(unsafe {
+        asm!("wbinvd");
+    });
+}
+
+const APIC_DEFAULT_VERSION_REGISTER_OFFSET: u64 = 0x30;
+const EXPECTED_APIC_VERSION_NUMBER: u32 = 0x50014;
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_mmio_apic_version() {
+    let version: u32;
+    let address = i32::try_from(APIC_DEFAULT_PHYS_BASE + APIC_DEFAULT_VERSION_REGISTER_OFFSET)
+        .expect("APIC address should fit in 32 bits");
+    verify_ghcb_gets_altered!(unsafe {
+        asm!(
+            "mov (%edx), %eax",
+            out("eax") version,
+            in("edx") address,
+            options(att_syntax)
+        )
+    });
+    assert_eq!(version, EXPECTED_APIC_VERSION_NUMBER);
+}
+
+const TESTDEV_ECHO_LAST_PORT: u16 = 0xe0;
+const TESTDEV_ECHO_STREAM_PORT: u16 = 0xf0;
+
+fn inb(port: u16) -> u8 {
+    unsafe {
+        let ret: u8;
+        asm!("inb %dx, %al", in("dx") port, out("al") ret, options(att_syntax));
+        ret
+    }
+}
+fn inb_from_testdev_echo() -> u8 {
+    unsafe {
+        let ret: u8;
+        asm!("inb $0xe0, %al", out("al") ret, options(att_syntax));
+        ret
+    }
+}
+
+fn outb(port: u16, value: u8) {
+    unsafe { asm!("outb %al, %dx", in("al") value, in("dx") port, options(att_syntax)) }
+}
+
+fn outb_to_testdev_echo(value: u8) {
+    unsafe { asm!("outb %al, $0xe0", in("al") value, options(att_syntax)) }
+}
+
+fn inw(port: u16) -> u16 {
+    unsafe {
+        let ret: u16;
+        asm!("inw %dx, %ax", in("dx") port, out("ax") ret, options(att_syntax));
+        ret
+    }
+}
+fn inw_from_testdev_echo() -> u16 {
+    unsafe {
+        let ret: u16;
+        asm!("inw $0xe0, %ax", out("ax") ret, options(att_syntax));
+        ret
+    }
+}
+
+fn outw(port: u16, value: u16) {
+    unsafe { asm!("outw %ax, %dx", in("ax") value, in("dx") port, options(att_syntax)) }
+}
+
+fn outw_to_testdev_echo(value: u16) {
+    unsafe { asm!("outw %ax, $0xe0", in("ax") value, options(att_syntax)) }
+}
+
+fn inl(port: u16) -> u32 {
+    unsafe {
+        let ret: u32;
+        asm!("inl %dx, %eax", in("dx") port, out("eax") ret, options(att_syntax));
+        ret
+    }
+}
+fn inl_from_testdev_echo() -> u32 {
+    unsafe {
+        let ret: u32;
+        asm!("inl $0xe0, %eax", out("eax") ret, options(att_syntax));
+        ret
+    }
+}
+
+fn outl(port: u16, value: u32) {
+    unsafe { asm!("outl %eax, %dx", in("eax") value, in("dx") port, options(att_syntax)) }
+}
+
+fn outl_to_testdev_echo(value: u32) {
+    unsafe { asm!("outl %eax, $0xe0", in("eax") value, options(att_syntax)) }
+}
+
+fn rep_outsw(port: u16, data: &[u16]) {
+    unsafe {
+        asm!("rep outsw", in("dx") port, in("rsi") data.as_ptr(), in("rcx") data.len(), options(att_syntax))
+    }
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_8() {
+    const TEST_VAL: u8 = 0x12;
+    verify_ghcb_gets_altered!(outb(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+    assert_eq!(
+        TEST_VAL,
+        verify_ghcb_gets_altered!(inb(TESTDEV_ECHO_LAST_PORT))
+    );
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_16() {
+    const TEST_VAL: u16 = 0x4321;
+    verify_ghcb_gets_altered!(outw(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+    assert_eq!(
+        TEST_VAL,
+        verify_ghcb_gets_altered!(inw(TESTDEV_ECHO_LAST_PORT))
+    );
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_32() {
+    const TEST_VAL: u32 = 0xabcd1234;
+    verify_ghcb_gets_altered!(outl(TESTDEV_ECHO_LAST_PORT, TEST_VAL));
+    assert_eq!(
+        TEST_VAL,
+        verify_ghcb_gets_altered!(inl(TESTDEV_ECHO_LAST_PORT))
+    );
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_8_hardcoded() {
+    const TEST_VAL: u8 = 0x12;
+    verify_ghcb_gets_altered!(outb_to_testdev_echo(TEST_VAL));
+    assert_eq!(TEST_VAL, verify_ghcb_gets_altered!(inb_from_testdev_echo()));
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_16_hardcoded() {
+    const TEST_VAL: u16 = 0x4321;
+    verify_ghcb_gets_altered!(outw_to_testdev_echo(TEST_VAL));
+    assert_eq!(TEST_VAL, verify_ghcb_gets_altered!(inw_from_testdev_echo()));
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_32_hardcoded() {
+    const TEST_VAL: u32 = 0xabcd1234;
+    verify_ghcb_gets_altered!(outl_to_testdev_echo(TEST_VAL));
+    assert_eq!(TEST_VAL, verify_ghcb_gets_altered!(inl_from_testdev_echo()));
+}
+
+#[test]
+#[cfg_attr(not(test_in_svsm), ignore = "Can only be run inside guest")]
+#[should_panic] // #VC handler is not yet implemented, so this should fail
+fn test_port_io_string_16_get_last() {
+    const TEST_DATA: &[u16] = &[0x1234, 0x5678, 0x9abc, 0xdef0];
+    verify_ghcb_gets_altered!(rep_outsw(TESTDEV_ECHO_LAST_PORT, TEST_DATA));
+    assert_eq!(
+        TEST_DATA.last().unwrap(),
+        &verify_ghcb_gets_altered!(inw(TESTDEV_ECHO_LAST_PORT))
+    );
 }
